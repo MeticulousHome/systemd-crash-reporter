@@ -6,7 +6,6 @@ PROJECT="$(pwd)/${DIR}"
 #docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 
 docker run --rm  \
-    -it \
     --platform=linux/arm64/v8 \
     -v ${PROJECT}:/app \
     ${CACHE_OPTIONS} \
