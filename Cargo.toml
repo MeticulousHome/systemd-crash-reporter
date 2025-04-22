@@ -1,0 +1,10 @@
+[package]
+name = "crash-reporter"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sentry = "0.37.0"
+sentry-log = "0.37.0"
+env_logger = "0.11"
+hostname = "0.3"
