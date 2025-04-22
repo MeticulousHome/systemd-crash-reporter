@@ -3,7 +3,9 @@ DIR=$(dirname $0)
 PROJECT="$(pwd)/${DIR}"
 
 # Run to register qemu static
-#docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+sudo apt update
+sudo apt install -y qemu-user-static
+docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 
 docker run --rm  \
     --platform=linux/arm64/v8 \
