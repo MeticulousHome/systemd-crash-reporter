@@ -2,15 +2,22 @@
 DIR=$(dirname $0)
 PROJECT="$(pwd)/${DIR}"
 
-# Run to register qemu static
-sudo apt update
-sudo apt install -y qemu-user-static
-docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+rustup target add aarch64-unknown-linux-gnu
 
-docker run --rm  \
-    --platform=linux/arm64/v8 \
-    -v ${PROJECT}:/app \
-    ${CACHE_OPTIONS} \
-    -w /app \
-    arm64v8/rust \
-    bash -c "apt update && apt -y install libssl-dev && cargo build --release"
+sudo apt-get update > /dev/null
+sudo apt install -y gcc-aarch64-linux-gnu
+
+CONFIG_FILE="$HOME/.cargo/config"
+
+if ! grep -q "\[target.aarch64-unknown-linux-gnu\]" "$CONFIG_FILE" 2>/dev/null || ! grep -q 'linker = "aarch64-linux-gnu-gcc"' "$CONFIG_FILE" 2>/dev/null; then
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    {
+        echo '[target.aarch64-unknown-linux-gnu]'
+        echo 'linker = "aarch64-linux-gnu-gcc"'
+    } >> "$CONFIG_FILE"
+    ecjo
+fi
+export TARGET_CC=aarch64-linux-gnu-gcc
+
+cargo build --target aarch64-unknown-linux-gnu --release
+cargo build --release
