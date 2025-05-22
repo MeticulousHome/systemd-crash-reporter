@@ -1,11 +1,10 @@
 #!/bin/bash
-DIR=$(dirname $0)
-PROJECT="$(pwd)/${DIR}"
+set -e
 
 rustup target add aarch64-unknown-linux-gnu
 
-sudo apt-get update > /dev/null
-sudo apt install -y gcc-aarch64-linux-gnu
+apt-get update > /dev/null
+apt install -y gcc-aarch64-linux-gnu
 
 CONFIG_FILE="$HOME/.cargo/config"
 
@@ -15,9 +14,10 @@ if ! grep -q "\[target.aarch64-unknown-linux-gnu\]" "$CONFIG_FILE" 2>/dev/null |
         echo '[target.aarch64-unknown-linux-gnu]'
         echo 'linker = "aarch64-linux-gnu-gcc"'
     } >> "$CONFIG_FILE"
-    ecjo
+    echo
 fi
 export TARGET_CC=aarch64-linux-gnu-gcc
 
+cd "/systemd-crash-reporter"
 cargo build --target aarch64-unknown-linux-gnu --release
 cargo build --release
