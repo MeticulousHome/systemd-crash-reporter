@@ -11,11 +11,11 @@ fn main() {
     ));
 
     // Extract environment variables provided by systemd
-    let unit = env::var("UNIT").unwrap_or_else(|_| "unknown".into());
-    let job_result = env::var("JOB_RESULT").unwrap_or_else(|_| "unknown".into());
-    let exit_code = env::var("EXIT_CODE").unwrap_or_else(|_| "unknown".into());
-    let exit_status = env::var("EXIT_STATUS").unwrap_or_else(|_| "unknown".into());
-    let invocation_id = env::var("INVOCATION_ID").unwrap_or_else(|_| "unknown".into());
+    let unit = env::var("MONITOR_UNIT").unwrap_or_else(|_| "unknown".into());
+    let job_result = env::var("MONITOR_SERVICE_RESULT").unwrap_or_else(|_| "unknown".into());
+    let exit_code = env::var("MONITOR_EXIT_CODE").unwrap_or_else(|_| "unknown".into());
+    let exit_status = env::var("MONITOR_EXIT_STATUS").unwrap_or_else(|_| "unknown".into());
+    let invocation_id = env::var("MONITOR_INVOCATION_ID").unwrap_or_else(|_| "unknown".into());
 
     // Get the machine's hostname
     let hostname = hostname::get()
