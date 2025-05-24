@@ -18,6 +18,9 @@ if ! grep -q "\[target.aarch64-unknown-linux-gnu\]" "$CONFIG_FILE" 2>/dev/null |
 fi
 export TARGET_CC=aarch64-linux-gnu-gcc
 
-cd "/systemd-crash-reporter"
+#get the script path
+DIR=$(dirname "$(realpath $0)")
+#go to the path of the script so cargo can find its config files
+cd "$DIR"
 cargo build --target aarch64-unknown-linux-gnu --release
 cargo build --release
