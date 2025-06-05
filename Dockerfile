@@ -9,7 +9,6 @@ RUN apt-get update && \
 VOLUME ["/systemd-crash-reporter"]
 
 # Install Rust using rustup
-# RUN curl  --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
