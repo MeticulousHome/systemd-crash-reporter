@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 fn main() {
     let _guard = sentry::init((
-        "http://7d92061929211477cb44b8071be63441@65.109.232.162/4",
+        "https://7d92061929211477cb44b8071be63441@sentry.meticulousespresso.com/4",
         sentry::ClientOptions {
             release: sentry::release_name!(),
             send_default_pii: false,
