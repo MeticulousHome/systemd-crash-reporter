@@ -1,17 +1,33 @@
 use std::env;
-use sentry::{protocol::Attachment, Scope, protocol::AttachmentType};
+use sentry::{protocol::{Attachment, AttachmentType}, types::Dsn, Client, Hub, Scope};
 use std::process::Command;
 use chrono::Utc;
+use std::sync::Arc;
 
 fn main() {
     let _guard = sentry::init((
-        "https://295725e5bbfc9b3eb0413cafc1f6cea6@o4506723336060928.ingest.us.sentry.io/4509197049593856",
+        "http://7d92061929211477cb44b8071be63441@65.109.232.162/4",
         sentry::ClientOptions {
             release: sentry::release_name!(),
             send_default_pii: false,
             ..Default::default()
         },
     ));
+    
+    let sc_dsn: Dsn = "https://295725e5bbfc9b3eb0413cafc1f6cea6@o4506723336060928.ingest.us.sentry.io/4509197049593856".parse().unwrap();
+
+    let mut sc_opts = sentry::ClientOptions {
+        debug: true,
+        release: sentry::release_name!(),
+        send_default_pii: false,
+        ..Default::default()
+    };
+    sc_opts.dsn = Some(sc_dsn);
+
+    sc_opts.transport = Some(Arc::new(sentry::transports::DefaultTransportFactory));
+    
+    let secondary_client = Some(Arc::new(Client::from_config(sc_opts)));
+
 
     // Extract environment variables provided by systemd
     let unit = env::var("MONITOR_UNIT").unwrap_or_else(|_| "unknown".into());
@@ -40,8 +56,7 @@ fn main() {
         let data: Vec<u8> = match output {
             Ok(cmd_out) => {
                 let logs = String::from_utf8_lossy(&cmd_out.stdout).to_ascii_lowercase();
-                // You can do extra logic here
-                println!("Got logs from {unit}:\n{logs}",);
+                println!("Got logs from {unit}\n",);
 
                 // Convert the command output to lowercase and append it to a header
                 [header.as_slice(), logs.as_bytes()].concat()
@@ -74,5 +89,11 @@ fn main() {
 
     // Send to Sentry
     sentry::capture_message(&error_msg, sentry::Level::Error);
+
+    Hub::with_active(|hub|{
+        hub.bind_client(secondary_client);
+        hub.capture_message(&error_msg, sentry::Level::Error);
+    });
+
     println!("Captured error: {}", error_msg);
 }
