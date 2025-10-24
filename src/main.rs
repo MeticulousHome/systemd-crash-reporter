@@ -51,6 +51,46 @@ fn main() {
                                                         .arg("-c")
                                                         .arg(format!("journalctl --no-pager -u {} --since=\"5 minutes ago\"", unit))
                                                         .output();
+    const BUILD_VERSION_PATH : &str = "/opt/image-build-version";
+    const BUILD_DATE_PATH : &str = "/opt/ROOTFS_BUILD_DATE";
+    let mut build_version = String::from("unknown");
+    if std::path::Path::new(BUILD_VERSION_PATH).exists(){
+        let output = Command::new("sh")
+                                        .arg("-c")
+                                        .arg(format!("cat {} ", BUILD_VERSION_PATH))
+                                        .output();
+        build_version = match output {
+            Ok(out) => {
+                let b_v = String::from_utf8_lossy(&out.stdout).into_owned();
+                println!("Got build version: {b_v}\n",);
+                b_v
+            }
+
+            Err(e) =>{
+                eprintln!("Command failed: {}", e);
+                String::from("unknown")
+            }
+        }
+    }
+    let mut build_date = String::from("unknown");
+    if std::path::Path::new(BUILD_DATE_PATH).exists(){
+        let output = Command::new("sh")
+                                                            .arg("-c")
+                                                            .arg(format!("cat {} ", BUILD_DATE_PATH))
+                                                            .output();
+        build_date = match output {
+            Ok(out) => {
+                let b_d = String::from_utf8_lossy(&out.stdout).into_owned();
+                println!("Got build date: {b_d}\n",);
+                b_d
+            }
+
+            Err(e) =>{
+                eprintln!("Command failed: {}", e);
+                String::from("unknown")
+            }
+        }
+    }
     sentry::configure_scope(|scope: &mut Scope| {
         let header = format!("\n =============== LAST 5 MINUTES OF LOGS FROM {} ===============\n\n", unit.to_ascii_uppercase()).into_bytes();
         let data: Vec<u8> = match output {
@@ -85,6 +125,9 @@ fn main() {
         map.insert(String::from("hostname"), hostname.clone().into());
         scope.set_context("machine", sentry::protocol::Context::Other(map));
         scope.add_attachment(attachment);
+        scope.set_tag("hostname",hostname.clone());
+        scope.set_tag("build-version", build_version.clone());
+        scope.set_tag("build-date", build_date.clone());
     });
 
     // Send to Sentry
