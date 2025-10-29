@@ -3,6 +3,7 @@ use sentry::{protocol::{Attachment, AttachmentType}, types::Dsn, Client, Hub, Sc
 use std::process::Command;
 use chrono::Utc;
 use std::sync::Arc;
+use std::fs;
 
 fn main() {
     let _guard = sentry::init((
@@ -69,7 +70,7 @@ fn main() {
             result
         }
         
-        Err(error) =>{
+        Err(cause) =>{
             println!("Error {} while reading file at: {}", cause, BUILD_VERSION_PATH);
             String::from("unknown")
         }
