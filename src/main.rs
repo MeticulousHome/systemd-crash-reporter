@@ -41,7 +41,7 @@ fn crash_message(unit: &str, job_result: &str, exit_code: &str, exit_status: &st
 
 fn main() {
     let _guard = sentry::init((
-        "https://7d92061929211477cb44b8071be63441@sentry.meticulousespresso.com/4",
+        "https://6f9403694443a82c06c958a8e6f40748@sentry.meticulousespresso.com/4",
         sentry::ClientOptions {
             release: sentry::release_name!(),
             send_default_pii: false,
