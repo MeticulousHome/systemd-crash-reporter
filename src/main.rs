@@ -5,6 +5,8 @@ use std::fs;
 use std::process::Command;
 use std::sync::Arc;
 
+mod system_metrics;
+
 const BUILD_VERSION_PATH: &str = "/opt/image-build-version";
 const BUILD_CHANNEL_PATH: &str = "/opt/image-build-channel";
 const BUILD_DATE_PATH: &str = "/opt/ROOTFS_BUILD_DATE";
@@ -74,7 +76,9 @@ fn sanitize_event(mut event: Event<'static>) -> Option<Event<'static>> {
     event.logentry = None;
     event.logger = None;
     event.modules.clear();
-    event.contexts.clear();
+    event.contexts.retain(|key, context| {
+        key == system_metrics::CONTEXT_NAME && system_metrics::sanitize(context)
+    });
     event.breadcrumbs.values.clear();
     event.exception.values.clear();
     event.stacktrace = None;
@@ -184,6 +188,7 @@ fn main() {
     let runtime_seconds = service_runtime_seconds(&unit);
     let component_version = component_version(&unit);
     let serial = machine_serial();
+    let system_metrics = system_metrics::collect(&unit);
 
     sentry::configure_scope(|scope: &mut Scope| {
         scope.clear_breadcrumbs();
@@ -208,6 +213,7 @@ fn main() {
         if let Some(value) = &serial {
             scope.set_tag("serial", value);
         }
+        scope.set_context(system_metrics::CONTEXT_NAME, system_metrics);
 
         let fingerprint = [
             "systemd-service-failure",
@@ -311,6 +317,34 @@ wifi:
         let sanitized = sanitize_event(event).expect("diagnostic event should be retained");
 
         assert_eq!(sanitized.tags.get("serial"), Some(&"M123-ABC".to_string()));
+    }
+
+    #[test]
+    fn event_sanitizer_retains_only_the_approved_system_metrics_context() {
+        let mut event = Event::default();
+        let mut metrics = std::collections::BTreeMap::new();
+        metrics.insert("memory-total-bytes".to_string(), 1024_u64.into());
+        metrics.insert("command-line".to_string(), "private argument".into());
+        event.contexts.insert(
+            system_metrics::CONTEXT_NAME.to_string(),
+            sentry::protocol::Context::Other(metrics),
+        );
+        event.contexts.insert(
+            "device".to_string(),
+            sentry::protocol::Context::Other(Default::default()),
+        );
+
+        let sanitized = sanitize_event(event).expect("diagnostic event should be retained");
+        assert_eq!(sanitized.contexts.len(), 1);
+        let sentry::protocol::Context::Other(metrics) = sanitized
+            .contexts
+            .get(system_metrics::CONTEXT_NAME)
+            .expect("approved metrics context should remain")
+        else {
+            panic!("system metrics should remain an arbitrary context");
+        };
+        assert!(metrics.contains_key("memory-total-bytes"));
+        assert!(!metrics.contains_key("command-line"));
     }
 
     #[test]
