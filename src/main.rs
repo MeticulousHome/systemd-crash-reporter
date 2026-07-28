@@ -5,13 +5,16 @@ use std::fs;
 use std::process::Command;
 use std::sync::Arc;
 
+mod system_metrics;
+
 const BUILD_VERSION_PATH: &str = "/opt/image-build-version";
 const BUILD_CHANNEL_PATH: &str = "/opt/image-build-channel";
 const BUILD_DATE_PATH: &str = "/opt/ROOTFS_BUILD_DATE";
+const MACHINE_CONFIG_PATH: &str = "/meticulous-user/config/config.yml";
 const UNKNOWN: &str = "unknown";
 const MAX_TAG_LENGTH: usize = 128;
 const MICROSECONDS_PER_SECOND: u64 = 1_000_000;
-const ALLOWED_EVENT_TAGS: [&str; 11] = [
+const ALLOWED_EVENT_TAGS: [&str; 12] = [
     "unit",
     "job-result",
     "exit-code",
@@ -23,6 +26,7 @@ const ALLOWED_EVENT_TAGS: [&str; 11] = [
     "restart-count",
     "runtime-seconds",
     "crash-reporter-version",
+    "serial",
 ];
 
 fn read_or_unknown(path: &str) -> String {
@@ -50,6 +54,19 @@ fn sanitize_technical_value(value: String) -> String {
     }
 }
 
+fn serial_from_config(config: &str) -> Option<String> {
+    let config: serde_yaml::Value = serde_yaml::from_str(config).ok()?;
+    let serial = config.get("system")?.get("serial")?.as_str()?;
+    let serial = sanitize_technical_value(serial.to_string());
+
+    (serial != UNKNOWN).then_some(serial)
+}
+
+fn machine_serial() -> Option<String> {
+    let config = fs::read_to_string(MACHINE_CONFIG_PATH).ok()?;
+    serial_from_config(&config)
+}
+
 fn sanitize_event(mut event: Event<'static>) -> Option<Event<'static>> {
     event.server_name = None;
     event.user = None;
@@ -59,7 +76,9 @@ fn sanitize_event(mut event: Event<'static>) -> Option<Event<'static>> {
     event.logentry = None;
     event.logger = None;
     event.modules.clear();
-    event.contexts.clear();
+    event.contexts.retain(|key, context| {
+        key == system_metrics::CONTEXT_NAME && system_metrics::sanitize(context)
+    });
     event.breadcrumbs.values.clear();
     event.exception.values.clear();
     event.stacktrace = None;
@@ -168,6 +187,8 @@ fn main() {
     let restart_count = systemd_property(&unit, "NRestarts");
     let runtime_seconds = service_runtime_seconds(&unit);
     let component_version = component_version(&unit);
+    let serial = machine_serial();
+    let system_metrics = system_metrics::collect(&unit);
 
     sentry::configure_scope(|scope: &mut Scope| {
         scope.clear_breadcrumbs();
@@ -189,6 +210,10 @@ fn main() {
         if let Some(value) = &runtime_seconds {
             scope.set_tag("runtime-seconds", value);
         }
+        if let Some(value) = &serial {
+            scope.set_tag("serial", value);
+        }
+        scope.set_context(system_metrics::CONTEXT_NAME, system_metrics);
 
         let fingerprint = [
             "systemd-service-failure",
@@ -258,6 +283,68 @@ mod tests {
             Some(&"meticulous-dial.service".to_string())
         );
         assert!(!sanitized.tags.contains_key("hostname"));
+    }
+
+    #[test]
+    fn serial_is_read_without_exposing_other_config_values() {
+        let config = r#"
+system:
+  serial: "M123-ABC"
+wifi:
+  KnownWifis:
+    - ssid: "Private Network"
+      password: "not-for-sentry"
+"#;
+
+        assert_eq!(serial_from_config(config), Some("M123-ABC".to_string()));
+    }
+
+    #[test]
+    fn serial_is_omitted_when_missing_invalid_or_not_a_string() {
+        assert_eq!(serial_from_config("system:\n  color: black\n"), None);
+        assert_eq!(serial_from_config("system: [invalid"), None);
+        assert_eq!(serial_from_config("system:\n  serial: 123\n"), None);
+        assert_eq!(serial_from_config("system:\n  serial: ' / = '\n"), None);
+    }
+
+    #[test]
+    fn event_sanitizer_retains_the_approved_serial_tag() {
+        let mut event = Event::default();
+        event
+            .tags
+            .insert("serial".to_string(), "M123-ABC".to_string());
+
+        let sanitized = sanitize_event(event).expect("diagnostic event should be retained");
+
+        assert_eq!(sanitized.tags.get("serial"), Some(&"M123-ABC".to_string()));
+    }
+
+    #[test]
+    fn event_sanitizer_retains_only_the_approved_system_metrics_context() {
+        let mut event = Event::default();
+        let mut metrics = std::collections::BTreeMap::new();
+        metrics.insert("memory-total-mib".to_string(), 973_u64.into());
+        metrics.insert("command-line".to_string(), "private argument".into());
+        event.contexts.insert(
+            system_metrics::CONTEXT_NAME.to_string(),
+            sentry::protocol::Context::Other(metrics),
+        );
+        event.contexts.insert(
+            "device".to_string(),
+            sentry::protocol::Context::Other(Default::default()),
+        );
+
+        let sanitized = sanitize_event(event).expect("diagnostic event should be retained");
+        assert_eq!(sanitized.contexts.len(), 1);
+        let sentry::protocol::Context::Other(metrics) = sanitized
+            .contexts
+            .get(system_metrics::CONTEXT_NAME)
+            .expect("approved metrics context should remain")
+        else {
+            panic!("system metrics should remain an arbitrary context");
+        };
+        assert!(metrics.contains_key("memory-total-mib"));
+        assert!(!metrics.contains_key("command-line"));
     }
 
     #[test]
