@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-sentry = {version = "0.37.0", features = ["reqwest", "backtrace"]}
-sentry-log = "0.37.0"
-env_logger = "0.11"
-hostname = "0.3"
-chrono = "0.4"
+sentry = { version = "0.37.0", features = ["reqwest", "backtrace"] }
 openssl = { version = "0.10.72", features = ["vendored"] }
+serde_yaml = "0.9.34"
