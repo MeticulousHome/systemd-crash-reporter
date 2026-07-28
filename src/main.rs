@@ -323,7 +323,7 @@ wifi:
     fn event_sanitizer_retains_only_the_approved_system_metrics_context() {
         let mut event = Event::default();
         let mut metrics = std::collections::BTreeMap::new();
-        metrics.insert("memory-total-bytes".to_string(), 1024_u64.into());
+        metrics.insert("memory-total-mib".to_string(), 973_u64.into());
         metrics.insert("command-line".to_string(), "private argument".into());
         event.contexts.insert(
             system_metrics::CONTEXT_NAME.to_string(),
@@ -343,7 +343,7 @@ wifi:
         else {
             panic!("system metrics should remain an arbitrary context");
         };
-        assert!(metrics.contains_key("memory-total-bytes"));
+        assert!(metrics.contains_key("memory-total-mib"));
         assert!(!metrics.contains_key("command-line"));
     }
 

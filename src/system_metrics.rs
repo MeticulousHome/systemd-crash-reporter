@@ -12,26 +12,28 @@ const ROOT_DISK_PATH: &str = "/";
 const USER_DATA_DISK_PATH: &str = "/meticulous-user";
 const TOP_PROCESS_COUNT: usize = 3;
 const BYTES_PER_KIB: u64 = 1024;
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+const NANOSECONDS_PER_TENTH_SECOND: u64 = 100_000_000;
 
 const ALLOWED_CONTEXT_FIELDS: [&str; 18] = [
-    "memory-total-bytes",
-    "memory-available-bytes",
-    "swap-total-bytes",
-    "swap-used-bytes",
-    "root-disk-total-bytes",
-    "root-disk-available-bytes",
+    "memory-total-mib",
+    "memory-available-mib",
+    "swap-total-mib",
+    "swap-used-mib",
+    "root-disk-total-mib",
+    "root-disk-available-mib",
     "root-disk-used-percent",
-    "user-data-disk-total-bytes",
-    "user-data-disk-available-bytes",
+    "user-data-disk-total-mib",
+    "user-data-disk-available-mib",
     "user-data-disk-used-percent",
-    "failed-service-memory-peak-bytes",
-    "failed-service-cpu-usage-nsec",
+    "failed-service-memory-peak-mib",
+    "failed-service-cpu-usage-seconds",
     "top-process-1",
-    "top-process-1-rss-bytes",
+    "top-process-1-rss-mib",
     "top-process-2",
-    "top-process-2-rss-bytes",
+    "top-process-2-rss-mib",
     "top-process-3",
-    "top-process-3-rss-bytes",
+    "top-process-3-rss-mib",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +191,16 @@ fn parse_unsigned(value: &str) -> Option<u64> {
     value.trim().parse().ok()
 }
 
+fn bytes_to_mib(value: u64) -> u64 {
+    value.saturating_add(BYTES_PER_MIB / 2) / BYTES_PER_MIB
+}
+
+fn nanoseconds_to_seconds(value: u64) -> f64 {
+    let tenths =
+        value.saturating_add(NANOSECONDS_PER_TENTH_SECOND / 2) / NANOSECONDS_PER_TENTH_SECOND;
+    tenths as f64 / 10.0
+}
+
 fn failed_service_memory_peak(control_group: Option<&str>) -> Option<u64> {
     let path = safe_cgroup_path(control_group?)?.join("memory.peak");
     parse_unsigned(&fs::read_to_string(path).ok()?)
@@ -217,12 +229,12 @@ fn insert_disk_metrics(
     snapshot: DiskSnapshot,
 ) {
     map.insert(
-        format!("{prefix}-disk-total-bytes"),
-        snapshot.total_bytes.into(),
+        format!("{prefix}-disk-total-mib"),
+        bytes_to_mib(snapshot.total_bytes).into(),
     );
     map.insert(
-        format!("{prefix}-disk-available-bytes"),
-        snapshot.available_bytes.into(),
+        format!("{prefix}-disk-available-mib"),
+        bytes_to_mib(snapshot.available_bytes).into(),
     );
     map.insert(
         format!("{prefix}-disk-used-percent"),
@@ -234,16 +246,22 @@ pub fn collect(unit: &str) -> Context {
     let mut map = BTreeMap::new();
 
     if let Some(memory) = memory_snapshot() {
-        map.insert("memory-total-bytes".to_string(), memory.total_bytes.into());
         map.insert(
-            "memory-available-bytes".to_string(),
-            memory.available_bytes.into(),
+            "memory-total-mib".to_string(),
+            bytes_to_mib(memory.total_bytes).into(),
         );
         map.insert(
-            "swap-total-bytes".to_string(),
-            memory.swap_total_bytes.into(),
+            "memory-available-mib".to_string(),
+            bytes_to_mib(memory.available_bytes).into(),
         );
-        map.insert("swap-used-bytes".to_string(), memory.swap_used_bytes.into());
+        map.insert(
+            "swap-total-mib".to_string(),
+            bytes_to_mib(memory.swap_total_bytes).into(),
+        );
+        map.insert(
+            "swap-used-mib".to_string(),
+            bytes_to_mib(memory.swap_used_bytes).into(),
+        );
     }
 
     if let Some(disk) = disk_snapshot(ROOT_DISK_PATH) {
@@ -256,16 +274,16 @@ pub fn collect(unit: &str) -> Context {
     let control_group = systemd_property(unit, "ControlGroup");
     if let Some(memory_peak) = failed_service_memory_peak(control_group.as_deref()) {
         map.insert(
-            "failed-service-memory-peak-bytes".to_string(),
-            memory_peak.into(),
+            "failed-service-memory-peak-mib".to_string(),
+            bytes_to_mib(memory_peak).into(),
         );
     }
     if let Some(cpu_usage) =
         systemd_property(unit, "CPUUsageNSec").and_then(|value| parse_unsigned(&value))
     {
         map.insert(
-            "failed-service-cpu-usage-nsec".to_string(),
-            cpu_usage.into(),
+            "failed-service-cpu-usage-seconds".to_string(),
+            nanoseconds_to_seconds(cpu_usage).into(),
         );
     }
 
@@ -273,8 +291,8 @@ pub fn collect(unit: &str) -> Context {
         let position = index + 1;
         map.insert(format!("top-process-{position}"), process.name.into());
         map.insert(
-            format!("top-process-{position}-rss-bytes"),
-            process.rss_bytes.into(),
+            format!("top-process-{position}-rss-mib"),
+            bytes_to_mib(process.rss_bytes).into(),
         );
     }
 
@@ -409,7 +427,7 @@ VmRSS:\t812000 kB
     #[test]
     fn context_sanitizer_keeps_only_approved_metrics() {
         let mut values = BTreeMap::new();
-        values.insert("memory-total-bytes".to_string(), 1024_u64.into());
+        values.insert("memory-total-mib".to_string(), 973_u64.into());
         values.insert("command-line".to_string(), "private argument".into());
         let mut context = Context::Other(values);
 
@@ -417,7 +435,14 @@ VmRSS:\t812000 kB
         let Context::Other(values) = context else {
             panic!("approved context should remain an arbitrary context");
         };
-        assert!(values.contains_key("memory-total-bytes"));
+        assert!(values.contains_key("memory-total-mib"));
         assert!(!values.contains_key("command-line"));
+    }
+
+    #[test]
+    fn telemetry_units_are_human_readable_and_rounded() {
+        assert_eq!(bytes_to_mib(199_491_584), 190);
+        assert_eq!(bytes_to_mib(286_396_416), 273);
+        assert_eq!(nanoseconds_to_seconds(1_556_872_315_000), 1556.9);
     }
 }
