@@ -1,425 +1,368 @@
-use chrono::Utc;
-use sentry::{
-    Client, Hub, Scope,
-    protocol::{Attachment, AttachmentType},
-    types::Dsn,
-};
+use sentry::Scope;
+use sentry::protocol::Event;
 use std::env;
 use std::fs;
 use std::process::Command;
 use std::sync::Arc;
 
+mod system_metrics;
+
 const BUILD_VERSION_PATH: &str = "/opt/image-build-version";
+const BUILD_CHANNEL_PATH: &str = "/opt/image-build-channel";
 const BUILD_DATE_PATH: &str = "/opt/ROOTFS_BUILD_DATE";
-const SERVICE_LOG_ATTACHMENT_BYTES: usize = 256 * 1024;
-const MEMORY_DIAGNOSTICS_ATTACHMENT_BYTES: usize = 256 * 1024;
-const GENERAL_JOURNAL_ATTACHMENT_BYTES: usize = 256 * 1024;
-const HIGH_MEMORY_SERVICE_LOG_ATTACHMENT_BYTES: usize = 256 * 1024;
-const SERVICE_MEMORY_RANKING_SCRIPT: &str = r#"
-systemctl list-units --type=service --all --plain --no-legend |
-awk '{print $1}' |
-while read -r unit; do
-    [ -n "$unit" ] || continue
-    peak=$(systemctl show "$unit" --property=MemoryPeak --value 2>/dev/null)
-    current=$(systemctl show "$unit" --property=MemoryCurrent --value 2>/dev/null)
-    case "$peak" in ''|'[not set]'|*[!0-9]*) peak=0 ;; esac
-    case "$current" in ''|'[not set]'|*[!0-9]*) current=0 ;; esac
-    printf "%s\t%s\t%s\n" "$peak" "$current" "$unit"
-done |
-sort -rn -k1,1 -k2,2 |
-head -n 20
-"#;
-
-fn run_command(title: &str, program: &str, args: &[&str]) -> String {
-    let mut section = format!("\n\n=============== {title} ===============\n\n");
-
-    match Command::new(program).args(args).output() {
-        Ok(output) => {
-            section.push_str(&format!("$ {} {}\n", program, args.join(" ")));
-            section.push_str(&format!("exit_status: {}\n\n", output.status));
-
-            if !output.stdout.is_empty() {
-                section.push_str(&String::from_utf8_lossy(&output.stdout));
-                if !section.ends_with('\n') {
-                    section.push('\n');
-                }
-            }
-
-            if !output.stderr.is_empty() {
-                section.push_str("\n--- stderr ---\n");
-                section.push_str(&String::from_utf8_lossy(&output.stderr));
-                if !section.ends_with('\n') {
-                    section.push('\n');
-                }
-            }
-        }
-        Err(e) => {
-            section.push_str(&format!("failed to run {}: {}\n", program, e));
-        }
-    }
-
-    section
-}
-
-fn truncate_for_attachment(text: String, max_bytes: usize) -> Vec<u8> {
-    let bytes = text.into_bytes();
-    if bytes.len() <= max_bytes {
-        return bytes;
-    }
-
-    let marker = b"\n\n[crash-reporter truncated attachment]\n\n";
-    let head_len = max_bytes / 3;
-    let tail_len = max_bytes - head_len - marker.len();
-
-    let mut truncated = Vec::with_capacity(max_bytes);
-    truncated.extend_from_slice(&bytes[..head_len]);
-    truncated.extend_from_slice(marker);
-    truncated.extend_from_slice(&bytes[bytes.len() - tail_len..]);
-    truncated
-}
+const MACHINE_CONFIG_PATH: &str = "/meticulous-user/config/config.yml";
+const UNKNOWN: &str = "unknown";
+const MAX_TAG_LENGTH: usize = 128;
+const MICROSECONDS_PER_SECOND: u64 = 1_000_000;
+const ALLOWED_EVENT_TAGS: [&str; 12] = [
+    "unit",
+    "job-result",
+    "exit-code",
+    "exit-status",
+    "build-version",
+    "build-channel",
+    "build-date",
+    "component-version",
+    "restart-count",
+    "runtime-seconds",
+    "crash-reporter-version",
+    "serial",
+];
 
 fn read_or_unknown(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_else(|cause| {
-        println!("Error {} while reading file at: {}", cause, path);
-        String::from("unknown")
+        println!("Error {cause} while reading file at: {path}");
+        UNKNOWN.to_string()
     })
 }
 
-fn collect_service_logs(unit: &str) -> Vec<u8> {
-    let mut logs = format!(
-        "\n=============== LAST LOGS FROM {} ===============\n\n",
-        unit.to_ascii_uppercase()
-    );
-    logs.push_str(&run_command(
-        "failed service journal",
-        "journalctl",
-        &[
-            "--no-pager",
-            "--output=short-iso",
-            "--unit",
-            unit,
-            "--since=10 minutes ago",
-            "--lines=300",
-        ],
-    ));
+fn sanitize_technical_value(value: String) -> String {
+    let sanitized: String = value
+        .trim()
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '.' | '_' | '-' | '@' | ':' | '+' | '~')
+        })
+        .take(MAX_TAG_LENGTH)
+        .collect();
 
-    truncate_for_attachment(logs, SERVICE_LOG_ATTACHMENT_BYTES)
+    if sanitized.is_empty() {
+        UNKNOWN.to_string()
+    } else {
+        sanitized
+    }
 }
 
-fn collect_general_journal_logs(failed_unit: &str) -> Vec<u8> {
-    let mut logs = format!(
-        "\n=============== GENERAL JOURNAL FOR OOM CRASH ===============\n\nfailed_unit: {failed_unit}\n\n"
-    );
-    logs.push_str(&run_command(
-        "general journal",
-        "journalctl",
-        &[
-            "--no-pager",
-            "--output=short-iso",
-            "--since=10 minutes ago",
-            "--lines=300",
-        ],
-    ));
+fn serial_from_config(config: &str) -> Option<String> {
+    let config: serde_yaml::Value = serde_yaml::from_str(config).ok()?;
+    let serial = config.get("system")?.get("serial")?.as_str()?;
+    let serial = sanitize_technical_value(serial.to_string());
 
-    truncate_for_attachment(logs, GENERAL_JOURNAL_ATTACHMENT_BYTES)
+    (serial != UNKNOWN).then_some(serial)
 }
 
-fn is_oom_failure(job_result: &str, exit_status: &str) -> bool {
-    job_result.eq_ignore_ascii_case("oom-kill") || exit_status.eq_ignore_ascii_case("oom-kill")
+fn machine_serial() -> Option<String> {
+    let config = fs::read_to_string(MACHINE_CONFIG_PATH).ok()?;
+    serial_from_config(&config)
 }
 
-fn highest_memory_peak_service() -> Option<String> {
-    let output = Command::new("sh")
-        .args(["-c", SERVICE_MEMORY_RANKING_SCRIPT])
-        .output()
-        .ok()?;
+fn sanitize_event(mut event: Event<'static>) -> Option<Event<'static>> {
+    event.server_name = None;
+    event.user = None;
+    event.request = None;
+    event.culprit = None;
+    event.transaction = None;
+    event.logentry = None;
+    event.logger = None;
+    event.modules.clear();
+    event.contexts.retain(|key, context| {
+        key == system_metrics::CONTEXT_NAME && system_metrics::sanitize(context)
+    });
+    event.breadcrumbs.values.clear();
+    event.exception.values.clear();
+    event.stacktrace = None;
+    event.template = None;
+    event.threads.values.clear();
+    event.extra.clear();
+    event.debug_meta = Default::default();
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let mut fields = line.split('\t');
-        let peak = fields.next()?.parse::<u64>().ok()?;
-        let current = fields.next()?.parse::<u64>().ok()?;
-        let unit = fields.next()?.trim();
-
-        if (peak > 0 || current > 0) && unit.ends_with(".service") {
-            return Some(unit.to_string());
-        }
+    event
+        .tags
+        .retain(|key, _| ALLOWED_EVENT_TAGS.contains(&key.as_str()));
+    for value in event.tags.values_mut() {
+        *value = sanitize_technical_value(std::mem::take(value));
     }
 
-    None
+    Some(event)
 }
 
-fn collect_high_memory_service_logs(failed_unit: &str) -> Option<(String, Vec<u8>)> {
-    let high_memory_unit = highest_memory_peak_service()?;
-    if high_memory_unit == failed_unit {
+fn command_value(program: &str, arguments: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(arguments).output().ok()?;
+    if !output.status.success() {
         return None;
     }
 
-    let mut logs = format!(
-        "\n=============== HIGH MEMORY SERVICE LOGS FOR OOM CRASH ===============\n\nfailed_unit: {failed_unit}\nhigh_memory_unit: {high_memory_unit}\n\n"
-    );
-    logs.push_str(&run_command(
-        "high memory service state",
-        "systemctl",
-        &["status", "--no-pager", "--lines=80", &high_memory_unit],
-    ));
-    logs.push_str(&run_command(
-        "high memory service journal",
-        "journalctl",
-        &[
-            "--no-pager",
-            "--output=short-iso",
-            "--unit",
-            &high_memory_unit,
-            "--since=10 minutes ago",
-            "--lines=150",
-        ],
-    ));
-
-    Some((
-        high_memory_unit,
-        truncate_for_attachment(logs, HIGH_MEMORY_SERVICE_LOG_ATTACHMENT_BYTES),
-    ))
+    let value = sanitize_technical_value(String::from_utf8(output.stdout).ok()?);
+    (value != UNKNOWN).then_some(value)
 }
 
-fn collect_memory_diagnostics(
-    unit: &str,
-    hostname: &str,
-    build_version: &str,
-    build_date: &str,
-    job_result: &str,
-    exit_code: &str,
-    exit_status: &str,
-    invocation_id: &str,
-) -> Vec<u8> {
-    let mut report = format!(
-        "\
-=============== CRASH CONTEXT ===============
-
-hostname: {hostname}
-unit: {unit}
-job_result: {job_result}
-exit_code: {exit_code}
-exit_status: {exit_status}
-invocation_id: {invocation_id}
-build_version: {}
-build_date: {}
-captured_at_utc: {}
-",
-        build_version.trim(),
-        build_date.trim(),
-        Utc::now().to_rfc3339()
-    );
-
-    report.push_str(&run_command("uptime", "uptime", &[]));
-    report.push_str(&run_command("free", "free", &["-h"]));
-    report.push_str(&run_command(
-        "failed unit systemd state",
+fn systemd_property(unit: &str, property: &str) -> Option<String> {
+    command_value(
         "systemctl",
-        &[
-            "show",
-            unit,
-            "--property=Id",
-            "--property=Description",
-            "--property=LoadState",
-            "--property=ActiveState",
-            "--property=SubState",
-            "--property=Result",
-            "--property=ExecMainCode",
-            "--property=ExecMainStatus",
-            "--property=InvocationID",
-            "--property=NRestarts",
-            "--property=Restart",
-            "--property=MemoryCurrent",
-            "--property=MemoryPeak",
-            "--property=MemoryHigh",
-            "--property=MemoryMax",
-            "--property=MemorySwapCurrent",
-            "--property=OOMPolicy",
-            "--property=CPUUsageNSec",
-        ],
-    ));
-    report.push_str(&run_command(
-        "meticulous slice memory",
-        "systemctl",
-        &[
-            "show",
-            "meticulous.slice",
-            "--property=MemoryCurrent",
-            "--property=MemoryPeak",
-            "--property=MemoryHigh",
-            "--property=MemoryMax",
-            "--property=MemorySwapCurrent",
-            "--property=CPUUsageNSec",
-        ],
-    ));
-    report.push_str(&run_command(
-        "service memory peak ranking",
-        "sh",
-        &["-c", SERVICE_MEMORY_RANKING_SCRIPT],
-    ));
-    report.push_str(&run_command(
-        "top processes by rss",
-        "sh",
-        &[
-            "-c",
-            "ps -eo pid,ppid,user,stat,comm,rss,vsz,pmem,pcpu,args --sort=-rss | head -n 40",
-        ],
-    ));
-    report.push_str(&run_command(
-        "service process tree",
-        "systemctl",
-        &["status", "--no-pager", "--lines=80", unit],
-    ));
-    report.push_str(&run_command(
-        "recent kernel oom lines",
-        "sh",
-        &[
-            "-c",
-            "journalctl --no-pager --output=short-iso --dmesg --since='30 minutes ago' | grep -Ei 'oom|out of memory|killed process|memory cgroup|invoked oom-killer' || true",
-        ],
-    ));
-    report.push_str(&run_command(
-        "recent systemd oomd lines",
-        "journalctl",
-        &[
-            "--no-pager",
-            "--output=short-iso",
-            "--unit=systemd-oomd.service",
-            "--since=30 minutes ago",
-            "--lines=200",
-        ],
-    ));
-    report.push_str(&run_command(
-        "proc meminfo",
-        "sh",
-        &["-c", "cat /proc/meminfo"],
-    ));
+        &["show", unit, "--property", property, "--value"],
+    )
+}
 
-    truncate_for_attachment(report, MEMORY_DIAGNOSTICS_ATTACHMENT_BYTES)
+fn component_package(unit: &str) -> Option<&'static str> {
+    match unit {
+        "meticulous-backend.service" => Some("meticulous-backend"),
+        "meticulous-dial.service" => Some("meticulous-dial"),
+        "meticulous-watcher.service" => Some("meticulous-watcher"),
+        "rauc-hawkbit-updater.service" => Some("rauc-hawkbit-updater"),
+        _ => None,
+    }
+}
+
+fn component_version(unit: &str) -> Option<String> {
+    let package = component_package(unit)?;
+    command_value(
+        "dpkg-query",
+        &["--show", "--showformat=${Version}", package],
+    )
+}
+
+fn runtime_seconds(start_micros: &str, exit_micros: &str) -> Option<String> {
+    let start_micros = start_micros.parse::<u64>().ok()?;
+    let exit_micros = exit_micros.parse::<u64>().ok()?;
+    let elapsed_micros = exit_micros.checked_sub(start_micros)?;
+
+    Some((elapsed_micros / MICROSECONDS_PER_SECOND).to_string())
+}
+
+fn service_runtime_seconds(unit: &str) -> Option<String> {
+    let start = systemd_property(unit, "ExecMainStartTimestampMonotonic")?;
+    let exit = systemd_property(unit, "ExecMainExitTimestampMonotonic")?;
+    runtime_seconds(&start, &exit)
+}
+
+fn crash_message(unit: &str, job_result: &str, exit_code: &str, exit_status: &str) -> String {
+    format!(
+        "Service {unit} crashed (job_result: {job_result}, exit_code: {exit_code}, exit_status: {exit_status})"
+    )
 }
 
 fn main() {
+    let build_version = sanitize_technical_value(read_or_unknown(BUILD_VERSION_PATH));
+    let build_channel = sanitize_technical_value(read_or_unknown(BUILD_CHANNEL_PATH));
+    let build_date = sanitize_technical_value(read_or_unknown(BUILD_DATE_PATH));
+    let release = format!("meticulous-linux@{build_version}");
+
     let _guard = sentry::init((
-        "https://7d92061929211477cb44b8071be63441@sentry.meticulousespresso.com/4",
+        "https://6f9403694443a82c06c958a8e6f40748@sentry.meticulousespresso.com/4",
         sentry::ClientOptions {
-            release: sentry::release_name!(),
+            release: Some(release.into()),
+            environment: Some(build_channel.clone().into()),
             send_default_pii: false,
+            default_integrations: false,
+            max_breadcrumbs: 0,
+            auto_session_tracking: false,
+            before_breadcrumb: Some(Arc::new(|_| None)),
+            before_send: Some(Arc::new(sanitize_event)),
             ..Default::default()
         },
     ));
 
-    let sc_dsn: Dsn = "https://295725e5bbfc9b3eb0413cafc1f6cea6@o4506723336060928.ingest.us.sentry.io/4509197049593856".parse().unwrap();
-
-    let mut sc_opts = sentry::ClientOptions {
-        debug: true,
-        release: sentry::release_name!(),
-        send_default_pii: false,
-        ..Default::default()
-    };
-    sc_opts.dsn = Some(sc_dsn);
-
-    sc_opts.transport = Some(Arc::new(sentry::transports::DefaultTransportFactory));
-
-    let secondary_client = Some(Arc::new(Client::from_config(sc_opts)));
-
-    // Extract environment variables provided by systemd
-    let unit = env::var("MONITOR_UNIT").unwrap_or_else(|_| "unknown".into());
-    let job_result = env::var("MONITOR_SERVICE_RESULT").unwrap_or_else(|_| "unknown".into());
-    let exit_code = env::var("MONITOR_EXIT_CODE").unwrap_or_else(|_| "unknown".into());
-    let exit_status = env::var("MONITOR_EXIT_STATUS").unwrap_or_else(|_| "unknown".into());
-    let invocation_id = env::var("MONITOR_INVOCATION_ID").unwrap_or_else(|_| "unknown".into());
-    // Get the machine's hostname
-    let hostname = hostname::get()
-        .map(|h| h.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "unknown".into());
-
-    // Construct an error message
-    let error_msg = format!(
-        "Service {} crashed (job_result: {}, exit_code: {}, exit_status: {}, invocation_id: {})",
-        unit, job_result, exit_code, exit_status, invocation_id
+    let unit =
+        sanitize_technical_value(env::var("MONITOR_UNIT").unwrap_or_else(|_| UNKNOWN.to_string()));
+    let job_result = sanitize_technical_value(
+        env::var("MONITOR_SERVICE_RESULT").unwrap_or_else(|_| UNKNOWN.to_string()),
     );
-
-    let build_version = read_or_unknown(BUILD_VERSION_PATH);
-    let build_date = read_or_unknown(BUILD_DATE_PATH);
+    let exit_code = sanitize_technical_value(
+        env::var("MONITOR_EXIT_CODE").unwrap_or_else(|_| UNKNOWN.to_string()),
+    );
+    let exit_status = sanitize_technical_value(
+        env::var("MONITOR_EXIT_STATUS").unwrap_or_else(|_| UNKNOWN.to_string()),
+    );
+    let restart_count = systemd_property(&unit, "NRestarts");
+    let runtime_seconds = service_runtime_seconds(&unit);
+    let component_version = component_version(&unit);
+    let serial = machine_serial();
+    let system_metrics = system_metrics::collect(&unit);
 
     sentry::configure_scope(|scope: &mut Scope| {
-        let date = Utc::now();
-        let logs_filename = format!("{hostname} {unit} {date} service logs.txt");
-        let diagnostics_filename = format!("{hostname} {unit} {date} memory diagnostics.txt");
-        let general_journal_filename = format!("{hostname} {unit} {date} general oom journal.txt");
-
-        let service_logs_attachment: Attachment = Attachment {
-            buffer: collect_service_logs(&unit),
-            filename: logs_filename,
-            content_type: Some("text/plain".to_string()),
-            ty: Some(AttachmentType::Attachment),
-        };
-
-        let diagnostics_attachment: Attachment = Attachment {
-            buffer: collect_memory_diagnostics(
-                &unit,
-                &hostname,
-                &build_version,
-                &build_date,
-                &job_result,
-                &exit_code,
-                &exit_status,
-                &invocation_id,
-            ),
-            filename: diagnostics_filename,
-            content_type: Some("text/plain".to_string()),
-            ty: Some(AttachmentType::Attachment),
-        };
-
-        let mut map = std::collections::BTreeMap::new();
-        map.insert(String::from("unit"), unit.clone().into());
-        map.insert(String::from("hostname"), hostname.clone().into());
-        map.insert(String::from("job_result"), job_result.clone().into());
-        map.insert(String::from("exit_code"), exit_code.clone().into());
-        map.insert(String::from("exit_status"), exit_status.clone().into());
-        map.insert(String::from("invocation_id"), invocation_id.clone().into());
-        scope.set_context("machine", sentry::protocol::Context::Other(map));
-        scope.add_attachment(service_logs_attachment);
-        scope.add_attachment(diagnostics_attachment);
-        if is_oom_failure(&job_result, &exit_status) {
-            let general_journal_attachment: Attachment = Attachment {
-                buffer: collect_general_journal_logs(&unit),
-                filename: general_journal_filename,
-                content_type: Some("text/plain".to_string()),
-                ty: Some(AttachmentType::Attachment),
-            };
-            scope.add_attachment(general_journal_attachment);
-
-            if let Some((high_memory_unit, buffer)) = collect_high_memory_service_logs(&unit) {
-                let high_memory_logs_filename =
-                    format!("{hostname} {high_memory_unit} {date} high memory service logs.txt");
-                let high_memory_logs_attachment: Attachment = Attachment {
-                    buffer,
-                    filename: high_memory_logs_filename,
-                    content_type: Some("text/plain".to_string()),
-                    ty: Some(AttachmentType::Attachment),
-                };
-                scope.add_attachment(high_memory_logs_attachment);
-                scope.set_tag("high-memory-unit", high_memory_unit);
-            }
-        }
+        scope.clear_breadcrumbs();
         scope.set_tag("unit", unit.clone());
         scope.set_tag("job-result", job_result.clone());
         scope.set_tag("exit-code", exit_code.clone());
         scope.set_tag("exit-status", exit_status.clone());
-        scope.set_tag("hostname", hostname.clone());
-        scope.set_tag("build-version", build_version.trim().to_string());
-        scope.set_tag("build-date", build_date.trim().to_string());
+        scope.set_tag("build-version", build_version.clone());
+        scope.set_tag("build-channel", build_channel.clone());
+        scope.set_tag("build-date", build_date.clone());
+        scope.set_tag("crash-reporter-version", env!("CARGO_PKG_VERSION"));
+
+        if let Some(value) = &component_version {
+            scope.set_tag("component-version", value);
+        }
+        if let Some(value) = &restart_count {
+            scope.set_tag("restart-count", value);
+        }
+        if let Some(value) = &runtime_seconds {
+            scope.set_tag("runtime-seconds", value);
+        }
+        if let Some(value) = &serial {
+            scope.set_tag("serial", value);
+        }
+        scope.set_context(system_metrics::CONTEXT_NAME, system_metrics);
+
+        let fingerprint = [
+            "systemd-service-failure",
+            unit.as_str(),
+            job_result.as_str(),
+            exit_code.as_str(),
+            exit_status.as_str(),
+        ];
+        scope.set_fingerprint(Some(&fingerprint));
     });
 
-    // Send to Sentry
-    sentry::capture_message(&error_msg, sentry::Level::Error);
+    let error_message = crash_message(&unit, &job_result, &exit_code, &exit_status);
+    sentry::capture_message(&error_message, sentry::Level::Error);
+    println!("Captured error: {error_message}");
+}
 
-    Hub::with_active(|hub| {
-        hub.bind_client(secondary_client);
-        hub.capture_message(&error_msg, sentry::Level::Error);
-    });
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    println!("Captured error: {}", error_msg);
+    #[test]
+    fn technical_values_are_bounded_and_remove_unapproved_characters() {
+        let value = format!(
+            " service name\x00 with spaces / secret={} ",
+            "x".repeat(200)
+        );
+        let sanitized = sanitize_technical_value(value);
+
+        assert!(sanitized.starts_with("servicenamewithspacessecret"));
+        assert!(sanitized.len() <= MAX_TAG_LENGTH);
+        for forbidden in [' ', '/', '=', '\0'] {
+            assert!(!sanitized.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn only_known_services_map_to_component_packages() {
+        assert_eq!(
+            component_package("meticulous-dial.service"),
+            Some("meticulous-dial")
+        );
+        assert_eq!(
+            component_package("meticulous-backend.service"),
+            Some("meticulous-backend")
+        );
+        assert_eq!(component_package("customer-provided.service"), None);
+    }
+
+    #[test]
+    fn event_sanitizer_keeps_only_approved_diagnostic_tags() {
+        let mut event = Event {
+            server_name: Some("personal-hostname".into()),
+            ..Default::default()
+        };
+        event
+            .tags
+            .insert("unit".to_string(), "meticulous-dial.service".to_string());
+        event
+            .tags
+            .insert("hostname".to_string(), "personal-hostname".to_string());
+
+        let sanitized = sanitize_event(event).expect("diagnostic event should be retained");
+
+        assert_eq!(sanitized.server_name, None);
+        assert_eq!(
+            sanitized.tags.get("unit"),
+            Some(&"meticulous-dial.service".to_string())
+        );
+        assert!(!sanitized.tags.contains_key("hostname"));
+    }
+
+    #[test]
+    fn serial_is_read_without_exposing_other_config_values() {
+        let config = r#"
+system:
+  serial: "M123-ABC"
+wifi:
+  KnownWifis:
+    - ssid: "Private Network"
+      password: "not-for-sentry"
+"#;
+
+        assert_eq!(serial_from_config(config), Some("M123-ABC".to_string()));
+    }
+
+    #[test]
+    fn serial_is_omitted_when_missing_invalid_or_not_a_string() {
+        assert_eq!(serial_from_config("system:\n  color: black\n"), None);
+        assert_eq!(serial_from_config("system: [invalid"), None);
+        assert_eq!(serial_from_config("system:\n  serial: 123\n"), None);
+        assert_eq!(serial_from_config("system:\n  serial: ' / = '\n"), None);
+    }
+
+    #[test]
+    fn event_sanitizer_retains_the_approved_serial_tag() {
+        let mut event = Event::default();
+        event
+            .tags
+            .insert("serial".to_string(), "M123-ABC".to_string());
+
+        let sanitized = sanitize_event(event).expect("diagnostic event should be retained");
+
+        assert_eq!(sanitized.tags.get("serial"), Some(&"M123-ABC".to_string()));
+    }
+
+    #[test]
+    fn event_sanitizer_retains_only_the_approved_system_metrics_context() {
+        let mut event = Event::default();
+        let mut metrics = std::collections::BTreeMap::new();
+        metrics.insert("memory-total-mib".to_string(), 973_u64.into());
+        metrics.insert("command-line".to_string(), "private argument".into());
+        event.contexts.insert(
+            system_metrics::CONTEXT_NAME.to_string(),
+            sentry::protocol::Context::Other(metrics),
+        );
+        event.contexts.insert(
+            "device".to_string(),
+            sentry::protocol::Context::Other(Default::default()),
+        );
+
+        let sanitized = sanitize_event(event).expect("diagnostic event should be retained");
+        assert_eq!(sanitized.contexts.len(), 1);
+        let sentry::protocol::Context::Other(metrics) = sanitized
+            .contexts
+            .get(system_metrics::CONTEXT_NAME)
+            .expect("approved metrics context should remain")
+        else {
+            panic!("system metrics should remain an arbitrary context");
+        };
+        assert!(metrics.contains_key("memory-total-mib"));
+        assert!(!metrics.contains_key("command-line"));
+    }
+
+    #[test]
+    fn runtime_is_derived_from_monotonic_systemd_timestamps() {
+        assert_eq!(runtime_seconds("1000000", "4500000"), Some("3".to_string()));
+        assert_eq!(runtime_seconds("4500000", "1000000"), None);
+        assert_eq!(runtime_seconds("not-a-timestamp", "4500000"), None);
+    }
+
+    #[test]
+    fn crash_message_contains_only_the_approved_fields() {
+        let message = crash_message("meticulous-backend.service", "failed", "exited", "1");
+
+        assert_eq!(
+            message,
+            "Service meticulous-backend.service crashed (job_result: failed, exit_code: exited, exit_status: 1)"
+        );
+        assert!(!message.contains("hostname"));
+        assert!(!message.contains("invocation"));
+    }
 }
